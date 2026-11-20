@@ -24,6 +24,7 @@ createApp({
     const reconAll = ref([]);
     const lateItems = ref([]);
     const lateSummary = ref({});
+    const attribution = ref({});
     const audits = ref([]);
     const contention = ref([]);
     const locks = ref([]);
@@ -94,6 +95,9 @@ createApp({
       const ls = await api.get("/api/late-bucket/summary");
       if (ls === null) return;
       lateSummary.value = ls.body || {};
+      const attr = await api.get("/api/late-attribution/registry");
+      if (attr === null) return;
+      attribution.value = attr.body || {};
       const ra = await api.get("/api/reconcile");
       if (ra === null) return;
       reconAll.value = Array.isArray(ra.body.items) ? ra.body.items : [];
@@ -204,6 +208,7 @@ createApp({
       reconAll,
       lateItems,
       lateSummary,
+      attribution,
       audits,
       contention,
       locks,
@@ -250,7 +255,8 @@ createApp({
       <div class="hero-side">
         <div>迟到桶</div>
         <div class="n">{{lateSummary.count||lateEvents.length}}</div>
-        <div style="opacity:.8;margin-top:8px">对账对齐：{{recon.aligned}}</div>
+        <div style="opacity:.8;margin-top:8px">孤儿桶 {{dash.orphan_buckets||0}} · 检疫 {{dash.quarantined_buckets||0}}</div>
+        <div style="opacity:.8">归属偏了 {{dash.attribution_drift||0}} · 对账对齐：{{recon.aligned}}</div>
         <div style="opacity:.8">争用 {{dash.contention||0}} · 暂存 {{dash.holds||0}}</div>
         <div style="margin-top:16px;font-size:12px;opacity:.75">{{user}} · <a href="#" style="color:#fff" @click.prevent="logout">退出</a></div>
       </div>
@@ -260,6 +266,7 @@ createApp({
       <div class="stat"><div class="k">已关窗</div><div class="v">{{dash.closed_windows||0}}</div></div>
       <div class="stat"><div class="k">拒收</div><div class="v">{{dash.rejects||0}}</div></div>
       <div class="stat"><div class="k">物化单</div><div class="v">{{dash.materializations||0}}</div></div>
+      <div class="stat"><div class="k">迟到桶/孤儿</div><div class="v">{{dash.late_bucket||0}}/{{dash.orphan_buckets||0}}</div></div>
     </div>
     <div class="board">
       ${windowsViewTemplate}

@@ -6,7 +6,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
-from db import connect, write_audit
+from db import begin_immediate, connect, finish, write_audit
 from locks import release, require_lock
 from models import HoldIn
 
@@ -28,8 +28,9 @@ def create_hold(body: HoldIn, authorization: AuthHeader = None):
     user = require_user(authorization)
     lock_key = f"hold:{body.window_name}"
     with connect() as conn:
-        require_lock(conn, lock_key, user)
+        begin_immediate(conn)
         try:
+            require_lock(conn, lock_key, user)
             w = conn.execute(
                 "SELECT * FROM windows WHERE name=?", (body.window_name,)
             ).fetchone()
@@ -52,7 +53,7 @@ def create_hold(body: HoldIn, authorization: AuthHeader = None):
             return {"ok": True, "hold_id": cur.lastrowid, "status": "暂存"}
         finally:
             release(conn, lock_key, user)
-            conn.commit()
+            finish(conn)
 
 
 @router.post("/api/holds/{hold_id}/release-stub")
@@ -60,6 +61,7 @@ def release_hold_stub(hold_id: int, authorization: AuthHeader = None):
     """空桩：暂存晋升正式或整笔回滚，写路径待题面择一。"""
     user = require_user(authorization)
     with connect() as conn:
+        begin_immediate(conn)
         row = conn.execute(
             "SELECT * FROM hold_staging WHERE id=?", (hold_id,)
         ).fetchone()

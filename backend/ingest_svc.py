@@ -6,7 +6,8 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
-from db import connect, write_audit
+from attribution_svc import require_path_a
+from db import begin_immediate, connect, finish, write_audit
 from locks import release, require_lock
 from models import EventIn
 
@@ -22,6 +23,7 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
     user = require_user(authorization)
     lock_key = f"ingest:{body.window_name}"
     with connect() as conn:
+        begin_immediate(conn)
         require_lock(conn, lock_key, user)
         try:
             w = conn.execute(
@@ -32,6 +34,8 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
             ts = body.event_ts
             created = _now()
             if w["status"] == "已关闭":
+                # 甲路径守卫：归属册未锁甲路径则整笔拒写并记归属偏了
+                require_path_a(conn, user, body.biz_key, {"write": "ingest_late"})
                 cur = conn.execute(
                     """INSERT INTO events(window_id,biz_key,event_ts,amount,disposition,created_at)
                        VALUES (?,?,?,?,?,?)""",
@@ -39,10 +43,11 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
                 )
                 eid = cur.lastrowid
                 conn.execute(
-                    """INSERT INTO late_bucket(event_id,window_name,biz_key,event_ts,amount,reason,created_at)
-                       VALUES (?,?,?,?,?,?,?)""",
+                    """INSERT INTO late_bucket(event_id,window_id,window_name,biz_key,event_ts,amount,reason,created_at)
+                       VALUES (?,?,?,?,?,?,?,?)""",
                     (
                         eid,
+                        w["id"],
                         body.window_name,
                         body.biz_key,
                         ts,
@@ -56,10 +61,10 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
                     user,
                     "ingest_late",
                     body.biz_key,
-                    {"window": body.window_name},
+                    {"window_id": w["id"], "window_name": body.window_name},
                 )
                 conn.commit()
-                return {"disposition": "迟到桶", "event_id": eid}
+                return {"disposition": "迟到桶", "event_id": eid, "window_id": w["id"]}
 
             if not (w["open_at"] <= ts <= w["close_at"]):
                 conn.execute(
@@ -105,7 +110,7 @@ def ingest_event(body: EventIn, authorization: AuthHeader = None):
             return {"disposition": "窗内", "window_id": w["id"], "event_id": cur.lastrowid}
         finally:
             release(conn, lock_key, user)
-            conn.commit()
+            finish(conn)
 
 
 @router.get("/api/events")

@@ -26,8 +26,8 @@ def reconcile(wid: int, authorization: AuthHeader = None):
             (wid,),
         ).fetchone()
         late = conn.execute(
-            "SELECT COUNT(*) c FROM late_bucket WHERE window_name=?",
-            (w["name"],),
+            "SELECT COUNT(*) c FROM late_bucket WHERE window_id=?",
+            (wid,),
         ).fetchone()["c"]
         rejects = conn.execute(
             "SELECT COUNT(*) c FROM reject_slips WHERE window_name=?",
@@ -66,8 +66,8 @@ def reconcile_all(authorization: AuthHeader = None):
                 (w["id"],),
             ).fetchone()
             late = conn.execute(
-                "SELECT COUNT(*) c FROM late_bucket WHERE window_name=?",
-                (w["name"],),
+                "SELECT COUNT(*) c FROM late_bucket WHERE window_id=?",
+                (w["id"],),
             ).fetchone()["c"]
             aligned = (
                 bool(mat)

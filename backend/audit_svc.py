@@ -42,16 +42,29 @@ def dashboard(authorization: AuthHeader = None):
             "SELECT COUNT(*) c FROM windows WHERE status='已关闭'"
         ).fetchone()["c"]
         late_n = conn.execute("SELECT COUNT(*) c FROM late_bucket").fetchone()["c"]
+        orphan_n = conn.execute(
+            """SELECT COUNT(*) c FROM late_bucket lb
+               LEFT JOIN windows w ON w.id=lb.window_id WHERE w.id IS NULL"""
+        ).fetchone()["c"]
+        quarantine_n = conn.execute(
+            "SELECT COUNT(*) c FROM late_bucket_quarantine"
+        ).fetchone()["c"]
         reject_n = conn.execute("SELECT COUNT(*) c FROM reject_slips").fetchone()["c"]
         hold_n = conn.execute(
             "SELECT COUNT(*) c FROM hold_staging WHERE status='暂存'"
         ).fetchone()["c"]
         mats = conn.execute("SELECT COUNT(*) c FROM materializations").fetchone()["c"]
         contention = conn.execute("SELECT COUNT(*) c FROM contention_log").fetchone()["c"]
+        drift = conn.execute(
+            "SELECT COALESCE(drift_rejections,0) c FROM late_attribution_registry WHERE id=1"
+        ).fetchone()["c"]
         return {
             "open_windows": open_n,
             "closed_windows": closed_n,
             "late_bucket": late_n,
+            "orphan_buckets": orphan_n,
+            "quarantined_buckets": quarantine_n,
+            "attribution_drift": drift,
             "rejects": reject_n,
             "holds": hold_n,
             "materializations": mats,

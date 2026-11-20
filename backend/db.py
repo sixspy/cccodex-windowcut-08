@@ -29,10 +29,29 @@ PRODUCT_META = {
 
 def connect() -> sqlite3.Connection:
     DATA.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    # autocommit（isolation_level=None）：事务边界由服务显式 BEGIN IMMEDIATE 控制，
+    # 避免 Python sqlite3 默认 deferred 事务把写锁拖到首次 DML 才取、并发互斥失效。
+    # timeout=0：写锁被占时后到者立即收到 SQLITE_BUSY，由锁层翻译为 409 争用——
+    # 双人同改一桶只许一方成功，后到只记争用、不排队、不串行化“看似成功”。
+    conn = sqlite3.connect(DB_PATH, timeout=0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def finish(conn: sqlite3.Connection) -> None:
+    """安全收尾：事务仍开着才 commit；已 commit/rollback 则不动作。
+
+    autocommit（isolation_level=None）连接上，对“无事务”状态再调 commit() 会隐式
+    BEGIN 一个空事务，导致 finally 里的锁释放无法落库；这里用 in_transaction 守门。
+    """
+    if getattr(conn, "in_transaction", False):
+        conn.commit()
+
+
+def begin_immediate(conn: sqlite3.Connection) -> None:
+    """开启立即写事务：进入即取 RESERVED 锁，并发写者在事务入口就撞锁而非中途。"""
+    conn.execute("BEGIN IMMEDIATE")
 
 
 def sha_password(password: str) -> str:
@@ -69,12 +88,36 @@ CREATE TABLE IF NOT EXISTS events(
 CREATE TABLE IF NOT EXISTS late_bucket(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   event_id INTEGER NOT NULL,
+  /* 甲路径：桶行必须挂存活 window_id 外键，窗删同事务拒删或级联迁移，杜绝孤儿/串名 */
+  window_id INTEGER NOT NULL REFERENCES windows(id) ON DELETE RESTRICT,
   window_name TEXT,
   biz_key TEXT NOT NULL,
   event_ts TEXT NOT NULL,
   amount REAL NOT NULL,
   reason TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+/* 迁移检疫：旧库回填 window_id 失败的桶行隔离于此，可核证、不静默丢弃、不串名 */
+CREATE TABLE IF NOT EXISTS late_bucket_quarantine(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id INTEGER,
+  legacy_window_name TEXT,
+  biz_key TEXT NOT NULL,
+  event_ts TEXT NOT NULL,
+  amount REAL NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  quarantined_at TEXT NOT NULL
+);
+/* 迟到归属册：选定甲/乙路径后当天禁改口；偏离拒写并记 late_attribution_drift */
+CREATE TABLE IF NOT EXISTS late_attribution_registry(
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  active_path TEXT NOT NULL,
+  path_name TEXT NOT NULL,
+  chosen_by TEXT NOT NULL,
+  chosen_date TEXT NOT NULL,
+  chosen_at TEXT NOT NULL,
+  drift_rejections INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS materializations(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -227,11 +270,15 @@ def seed_if_empty(conn: sqlite3.Connection) -> None:
             ),
         )
         if e["disposition"] == "迟到桶":
+            seed_w = conn.execute(
+                "SELECT id FROM windows WHERE name='W-1101'"
+            ).fetchone()
             conn.execute(
-                """INSERT INTO late_bucket(event_id,window_name,biz_key,event_ts,amount,reason,created_at)
-                   VALUES (?,?,?,?,?,?,?)""",
+                """INSERT INTO late_bucket(event_id,window_id,window_name,biz_key,event_ts,amount,reason,created_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
                 (
                     conn.execute("SELECT last_insert_rowid()").fetchone()[0],
+                    seed_w["id"],
                     "W-1101",
                     e["biz_key"],
                     e["event_ts"],
@@ -250,9 +297,87 @@ def seed_if_empty(conn: sqlite3.Connection) -> None:
     )
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_late_bucket_fk(conn: sqlite3.Connection) -> None:
+    """挂卷迁移：旧 late_bucket（仅 window_name）升级为甲路径外键表。
+
+    - 能按窗名匹配到存活窗的行回填 window_id（同名窗取现存唯一行）；
+    - 匹配不上的行整笔转入 late_bucket_quarantine 检疫，可核证、不丢、不串名；
+    - 表整体重建以挂上 NOT NULL + FOREIGN KEY，迁移在单事务内完成。
+    """
+    if "window_id" in _table_columns(conn, "late_bucket"):
+        return  # 新库或已迁移
+    conn.execute(
+        """CREATE TABLE late_bucket_new(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             event_id INTEGER NOT NULL,
+             window_id INTEGER NOT NULL REFERENCES windows(id) ON DELETE RESTRICT,
+             window_name TEXT,
+             biz_key TEXT NOT NULL,
+             event_ts TEXT NOT NULL,
+             amount REAL NOT NULL,
+             reason TEXT NOT NULL,
+             created_at TEXT NOT NULL
+           )"""
+    )
+    from datetime import datetime
+
+    now = datetime.now().isoformat(timespec="seconds")
+    legacy_rows = conn.execute("SELECT * FROM late_bucket").fetchall()
+    for r in legacy_rows:
+        w = conn.execute(
+            "SELECT id FROM windows WHERE name=?", (r["window_name"],)
+        ).fetchone()
+        if w is None:
+            conn.execute(
+                """INSERT INTO late_bucket_quarantine(
+                     event_id,legacy_window_name,biz_key,event_ts,amount,reason,
+                     created_at,quarantined_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    r["event_id"], r["window_name"], r["biz_key"], r["event_ts"],
+                    r["amount"], r["reason"], r["created_at"], now,
+                ),
+            )
+            continue
+        conn.execute(
+            """INSERT INTO late_bucket_new(
+                 id,event_id,window_id,window_name,biz_key,event_ts,amount,reason,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                r["id"], r["event_id"], w["id"], r["window_name"], r["biz_key"],
+                r["event_ts"], r["amount"], r["reason"], r["created_at"],
+            ),
+        )
+    conn.execute("DROP TABLE late_bucket")
+    conn.execute("ALTER TABLE late_bucket_new RENAME TO late_bucket")
+
+
+def _ensure_attribution_registry(conn: sqlite3.Connection) -> None:
+    """归属册初始化：本仓业务窗关账选甲路径（window_id 外键），当天锁定。"""
+    from datetime import datetime
+
+    row = conn.execute("SELECT id FROM late_attribution_registry WHERE id=1").fetchone()
+    if row is not None:
+        return
+    today = datetime.now().date().isoformat()
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT INTO late_attribution_registry(
+             id,active_path,path_name,chosen_by,chosen_date,chosen_at,drift_rejections)
+           VALUES (1,'A','window_id_fk','system',?,?,0)""",
+        (today, now),
+    )
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate_late_bucket_fk(conn)
+        _ensure_attribution_registry(conn)
         ensure_users(conn)
         seed_if_empty(conn)
         conn.commit()

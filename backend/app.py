@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from audit_svc import router as audit_router
+from attribution_svc import router as attribution_router
 from auth import router as auth_router
 from db import FRONTEND, PRODUCT_META, init_db
 from hold_svc import router as hold_router
@@ -35,6 +36,7 @@ for r in (
     windows_router,
     ingest_router,
     late_router,
+    attribution_router,
     materialize_router,
     reconcile_router,
     locks_router,

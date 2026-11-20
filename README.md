@@ -38,6 +38,22 @@
 - 窗重开作废重算 vs 增量补丁合并
 - 切版旁路暂存 vs 开始瞬间拒收
 
+## 迟到归属（甲路径，当天锁定，见 `docs/迟到归属册.md`）
+
+迟到桶曾按 `window_name` 字符串汇总，删窗后桶行成孤儿、同名新窗会跨窗串桶，摘要卡与明细表漂移。
+本仓选定**甲路径**并写入 `late_attribution_registry`（当天禁改口，偏离拒写并记 `late_attribution_drift`）：
+
+- `late_bucket.window_id` 为 `NOT NULL REFERENCES windows(id) ON DELETE RESTRICT` 存活外键；
+- 删窗同事务拒删，或带 `migrate_to` 级联改挂后删窗，冲突整笔回滚；
+- 改挂桶行占桶锁 `late-bucket:{id}`，双人同改后到者 409 只记争用；
+- 写事务 `BEGIN IMMEDIATE` + `busy_timeout=0`，写锁入口即定；
+- 旧库挂卷升级自动回填 `window_id`，匹配不上的进 `late_bucket_quarantine` 检疫，不丢不串；
+- 迟到明细 / 汇总卡 / 窗口条带 / 对账迟到计数 / 审计五处同态，终态 `orphan_buckets=0`。
+
+新增接口：`GET/POST /api/late-attribution/registry|choose`、`POST /api/late-bucket/reassign`、
+`DELETE /api/windows/{wid}?migrate_to=`、`GET /api/late-bucket/quarantine`。
+红测先行见 `tests/test_late_attribution.py`（跨窗串桶/孤儿失败测 + 双人争用失败测）。
+
 ## 启动（一键）
 
 ```powershell

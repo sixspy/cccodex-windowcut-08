@@ -6,7 +6,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
-from db import connect, write_audit
+from db import begin_immediate, connect, finish, write_audit
 from locks import release, require_lock
 from models import MaterializeIn
 
@@ -22,8 +22,9 @@ def materialize(
     user = require_user(authorization)
     lock_key = f"materialize:{wid}"
     with connect() as conn:
-        require_lock(conn, lock_key, user)
+        begin_immediate(conn)
         try:
+            require_lock(conn, lock_key, user)
             w = conn.execute("SELECT * FROM windows WHERE id=?", (wid,)).fetchone()
             if not w:
                 raise HTTPException(404, "窗口不存在")
@@ -66,7 +67,7 @@ def materialize(
             }
         finally:
             release(conn, lock_key, user)
-            conn.commit()
+            finish(conn)
 
 
 @router.get("/api/materializations")

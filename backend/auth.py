@@ -7,7 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
-from db import connect, sha_password, write_audit
+from db import begin_immediate, connect, sha_password, write_audit
 
 SESSIONS: dict[str, str] = {}
 router = APIRouter(tags=["auth"])
@@ -34,6 +34,7 @@ AuthHeader = Annotated[str | None, Header()]
 @router.post("/api/login")
 def login(body: LoginIn):
     with connect() as conn:
+        begin_immediate(conn)
         row = conn.execute(
             "SELECT username,role FROM users WHERE username=? AND password_sha=?",
             (body.username, sha_password(body.password)),
